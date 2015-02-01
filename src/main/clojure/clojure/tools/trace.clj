@@ -312,29 +312,21 @@ such as clojure.core/+"
   `(do
      ~@(map trace-form body)))
 
-(defn ^{:skip-wiki true} trace-var*
-  "If the specified Var holds an IFn and is not marked as a macro, its
-  contents is replaced with a version wrapped in a tracing call;
-  otherwise nothing happens. Can be undone with untrace-var.
-
-  In the unary case, v should be a Var object or a symbol to be
-  resolved in the current namespace.
-
-  In the binary case, ns should be a namespace object or a symbol
-  naming a namespace and s a symbol to be resolved in that namespace."
-  ([ns s]
-     (trace-var* (ns-resolve ns s)))
-  ([v]
-     (let [^clojure.lang.Var v (if (var? v) v (resolve v))
-           ns (.ns v)
-           s  (.sym v)]
-       (if (and (ifn? @v) (-> v meta :macro not) (-> v meta ::traced not))
-         (let [f @v
-               vname (symbol (str ns "/" s))]
-           (doto v
-             (alter-var-root #(fn tracing-wrapper [& args]
-                                (trace-fn-call vname % args)))
-             (alter-meta! assoc ::traced f)))))))
+(defn throttler [max in-period]
+  (let [last (ref 0)
+        count (ref 0)
+        throttled? (ref false)]
+    (fn []
+      (dosync
+        (let [this-time (System/currentTimeMillis)]
+          (alter count inc)
+          (if (< (- this-time @last) in-period)
+            (ref-set throttled? (>= @count max))
+            (do
+              (ref-set count 0)
+              (ref-set throttled? false)))
+          (ref-set last this-time)
+          @throttled?)))))
 
 (defn ^{:skip-wiki true} untrace-var*
   "Reverses the effect of trace-var / trace-vars / trace-ns for the
@@ -353,6 +345,46 @@ such as clojure.core/+"
          (doto v
            (alter-var-root (constantly ((meta v) ::traced)))
            (alter-meta! dissoc ::traced))))))
+
+(defn do-trace-var* [v {:keys [max max-in-period period]}]
+  (let [^clojure.lang.Var v (if (var? v) v (resolve v))
+        ns (.ns v)
+        s  (.sym v)
+        cnt (atom 0)
+        throttle? (if (and max-in-period period)
+                   (throttler max-in-period period)
+                   (constantly false))]
+    (if (and (ifn? @v) (-> v meta :macro not) (-> v meta ::traced not))
+      (let [f @v
+            vname (symbol (str ns "/" s))]
+        (doto v
+          (alter-var-root #(fn tracing-wrapper [& args]
+                             (swap! cnt inc)
+                             (let [ret (if (throttle?)
+                                         (apply % args)
+                                         (trace-fn-call vname % args))]
+                               (when (and max (= @cnt max))
+                                 (untrace-var* v))
+                               ret)))
+          (alter-meta! assoc ::traced f))))))
+
+(defn trace-opts [v opts]
+  (do-trace-var* v opts))
+
+(defn ^{:skip-wiki true} trace-var*
+  "If the specified Var holds an IFn and is not marked as a macro, its
+  contents is replaced with a version wrapped in a tracing call;
+  otherwise nothing happens. Can be undone with untrace-var.
+
+  In the unary case, v should be a Var object or a symbol to be
+  resolved in the current namespace.
+
+  In the binary case, ns should be a namespace object or a symbol
+  naming a namespace and s a symbol to be resolved in that namespace."
+  ([ns s]
+     (do-trace-var* (ns-resolve ns s) nil))
+  ([v]
+     (do-trace-var* v nil)))
 
 (defmacro trace-vars
   "Trace each of the specified Vars.
